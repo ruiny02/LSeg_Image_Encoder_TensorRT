@@ -69,8 +69,8 @@ if __name__ == '__main__':
         output_names=['output'],
         opset_version=14,
         dynamic_axes={
-            'input': {2: 'height', 3: 'width'},
-            'output': {2: 'height', 3: 'width'},
+            'input': {0: 'batch', 2: 'height', 3: 'width'},
+            'output': {0: 'batch', 2: 'height', 3: 'width'},
         }
     )
 

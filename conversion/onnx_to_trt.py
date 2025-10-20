@@ -77,11 +77,15 @@ def build_dynamic_engine(onnx_path,
 
         input_tensor = network.get_input(0)
         profile = builder.create_optimization_profile()
+        # Scannet 원본 encode_images.py 입력과 동일 범위를 보장:
+        #  base 320x240 × 0.75 → 240x180 까지 허용
+        #  (N,C,H,W) = (1,3,180,240) .. (1,3,1024,1024)
+        # 배치도 동적으로: flip 배치=2를 위해 N∈[1,2]
         profile.set_shape(
             input_tensor.name,
-            (1, 3, 256, 256),  # MIN
-            (1, 3, 480, 480),  # OPT
-            (1, 3, 1024, 1024),  # MAX
+            (1, 3, 180, 240),   # MIN  (N=1, H=180, W=240)
+            (2, 3, 360, 480),   # OPT  (N=2, 480x360)
+            (2, 3, 1024, 1024)  # MAX  (N=2)
         )
         config.add_optimization_profile(profile)
 

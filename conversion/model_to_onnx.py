@@ -55,16 +55,16 @@ if __name__ == "__main__":
     onnx_filename = f"models/onnx_engines/lseg_img_enc_vit_{tag}.onnx"
     
     torch.onnx.export(
-    model,
-    dummy_input,
-    onnx_filename,
-    input_names=["input"],
-    output_names=["output"],
-    opset_version=14,
-    # ← 여기서 dynamic_axes 지정
-    dynamic_axes={
-        "input":  {2: "height", 3: "width"},
-        "output": {2: "height", 3: "width"},
-    }
-)
+        model,
+        dummy_input,
+        onnx_filename,
+        input_names=["input"],
+        output_names=["output"],
+        opset_version=14,
+        # 동적 배치 + 동적 공간축
+        dynamic_axes={
+            "input":  {0: "batch", 2: "height", 3: "width"},
+            "output": {0: "batch", 2: "height", 3: "width"},
+        }
+    )
 print(f"✅ Dynamic ONNX 저장: {onnx_filename}")
