@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export LD_LIBRARY_PATH=/opt/hpcx/ucx/lib:/opt/hpcx/ucc/lib:${LD_LIBRARY_PATH:-}
+
 # 1) TensorRT 경로 보정 (repo의 CMakeLists.txt가 /usr/local/tensorrt 기준)
 arch="$(uname -m)"
 mkdir -p /usr/local/tensorrt
