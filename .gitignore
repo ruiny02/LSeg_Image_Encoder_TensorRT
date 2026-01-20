@@ -32,6 +32,7 @@ outputs/
 *.ckpt
 *.onnx
 *.trt
+models/weights/
 
 # Dataset 관련
 fewshot_data/

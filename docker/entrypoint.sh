@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export LD_LIBRARY_PATH=/opt/hpcx/ucx/lib:/opt/hpcx/ucc/lib:${LD_LIBRARY_PATH:-}
+# (공통) 출력 디렉토리 자동 생성
+mkdir -p /workspace/models/onnx_engines /workspace/models/trt_engines
+
+# (x86 NGC pytorch만) UCX/UCC 충돌 회피 - Jetson에는 보통 /opt/hpcx 없음
+if [ -d /opt/hpcx/ucx/lib ] && [ -d /opt/hpcx/ucc/lib ]; then
+  export LD_LIBRARY_PATH=/opt/hpcx/ucx/lib:/opt/hpcx/ucc/lib:${LD_LIBRARY_PATH:-}
+fi
 
 # 1) TensorRT 경로 보정 (repo의 CMakeLists.txt가 /usr/local/tensorrt 기준)
 arch="$(uname -m)"
