@@ -1,0 +1,79 @@
+# syntax=docker/dockerfile:1.6
+
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.08-py3
+
+############################
+# build stage
+############################
+FROM ${BASE_IMAGE} AS build
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 빌드/런타임 공통 유틸 + C++ 빌드 도구
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-venv python3-dev python3-pip \
+    build-essential cmake git wget curl pkg-config \
+    zlib1g-dev libopencv-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+# venv (system site packages 사용: 베이스 이미지에 이미 torch/tensorrt 등이 있음)
+RUN python3 -m venv --system-site-packages /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+# 파이썬 deps
+COPY requirements/requirements.x86.txt /tmp/requirements.x86.txt
+RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.x86.txt
+
+# (수정) libcudart 위치 탐색 시 /usr/local/cuda 심링크를 따라가도록 수정
+RUN set -eux; \
+  CUDA_ROOT="$(readlink -f /usr/local/cuda || echo /usr/local/cuda)"; \
+  echo "CUDA_ROOT=${CUDA_ROOT}"; \
+  REAL="$(find "${CUDA_ROOT}" -name 'libcudart.so*' -type f ! -path '*/stubs/*' | sort | tail -n1)"; \
+  echo "REAL_CUDART=${REAL}"; \
+  test -n "${REAL}"; \
+  LIB64="$(readlink -f /usr/local/cuda/lib64 2>/dev/null || true)"; \
+  if [ -z "${LIB64}" ]; then LIB64="${CUDA_ROOT}/lib64"; fi; \
+  mkdir -p "${LIB64}"; \
+  ln -sf "${REAL}" "${LIB64}/libcudart.so"; \
+  arch="$(uname -m)"; \
+  if [ -d "/usr/lib/${arch}-linux-gnu" ]; then \
+    ln -sf "${REAL}" "/usr/lib/${arch}-linux-gnu/libcudart.so"; \
+  fi; \
+  ldconfig
+
+# C++ prebuild (CUDA driver는 build 시점에 없을 수 있어 stub로 링크)
+COPY CPP_Project /opt/src/CPP_Project
+WORKDIR /opt/src
+
+RUN set -eux; \
+  CUDA_STUB="/usr/local/cuda/lib64/stubs/libcuda.so"; \
+  cd CPP_Project/Inference_Time_Tester; \
+  cmake -B build -S . -DCUDA_DRIVER_LIBRARY="${CUDA_STUB}"; \
+  cmake --build build -j"$(nproc)"; \
+  cd ../Feature_Extractor; \
+  cmake -B build -S . -DCUDA_DRIVER_LIBRARY="${CUDA_STUB}"; \
+  cmake --build build -j"$(nproc)"; \
+  mkdir -p /opt/prebuilt/Inference_Time_Tester /opt/prebuilt/Feature_Extractor; \
+  cp -f ../Inference_Time_Tester/build/trt_cpp_infer_time_tester /opt/prebuilt/Inference_Time_Tester/; \
+  cp -f build/trt_feature_extractor /opt/prebuilt/Feature_Extractor/
+############################
+# runtime stage
+############################
+FROM ${BASE_IMAGE} AS runtime
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 런타임에 필요한 최소(일단 안전하게 opencv 런타임 포함 위해 dev로 통일)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-venv python3-pip \
+    libopencv-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/venv /opt/venv
+COPY --from=build /opt/prebuilt /opt/prebuilt
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENV PATH=/opt/venv/bin:$PATH
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["bash"]

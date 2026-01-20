@@ -1,0 +1,103 @@
+# syntax=docker/dockerfile:1.6
+
+ARG BASE_IMAGE=nvcr.io/nvidia/l4t-jetpack:r36.4.0
+
+############################
+# build stage
+############################
+FROM ${BASE_IMAGE} AS build
+ENV DEBIAN_FRONTEND=noninteractive
+
+# apt deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-venv python3-dev python3-pip \
+    build-essential cmake git wget curl pkg-config \
+    zlib1g-dev libopencv-dev \
+    libopenblas-base libopenmpi-dev libomp-dev \
+    python3-pycuda \
+  && rm -rf /var/lib/apt/lists/*
+
+# venv (TensorRT/python3-pycuda는 시스템에 있으므로 system-site-packages)
+RUN python3 -m venv --system-site-packages /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+# Jetson PyTorch wheels (JP6 / CUDA12.6 / Python3.10)
+# NVIDIA 포럼에서 안내한 wheel 경로 기반 (numpy<2 선행 권장) :contentReference[oaicite:6]{index=6}
+RUN python3 -m pip install --no-cache-dir "numpy<2"
+
+ARG JPL_BASE=https://pypi.jetson-ai-lab.io/jp6/cu126
+ARG JPL_FALLBACK=https://pypi.jetson-ai-lab.dev/jp6/cu126
+
+ARG TORCH_WHL=+f/6cc/6ecfe8a5994fd/torch-2.6.0-cp310-cp310-linux_aarch64.whl
+ARG TV_WHL=+f/aa2/2da8dcf4c4c8d/torchvision-0.21.0-cp310-cp310-linux_aarch64.whl
+ARG TA_WHL=+f/dda/ce98dc7d89263/torchaudio-2.6.0-cp310-cp310-linux_aarch64.whl
+
+RUN set -eux; \
+  (wget -O /tmp/torch.whl      "${JPL_BASE}/${TORCH_WHL}" || wget -O /tmp/torch.whl      "${JPL_FALLBACK}/${TORCH_WHL}"); \
+  (wget -O /tmp/torchvision.whl "${JPL_BASE}/${TV_WHL}"   || wget -O /tmp/torchvision.whl "${JPL_FALLBACK}/${TV_WHL}"); \
+  (wget -O /tmp/torchaudio.whl  "${JPL_BASE}/${TA_WHL}"   || wget -O /tmp/torchaudio.whl  "${JPL_FALLBACK}/${TA_WHL}"); \
+  python3 -m pip install --no-cache-dir --force-reinstall --no-cache-dir \
+    /tmp/torch.whl /tmp/torchvision.whl /tmp/torchaudio.whl; \
+  rm -f /tmp/*.whl
+
+# 파이썬 deps (Jetson 전용)
+COPY requirements/requirements.jetson.txt /tmp/requirements.jetson.txt
+RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.jetson.txt
+
+# (수정) libcudart 위치 탐색 시 /usr/local/cuda 심링크를 따라가도록 수정
+RUN set -eux; \
+  CUDA_ROOT="$(readlink -f /usr/local/cuda || echo /usr/local/cuda)"; \
+  echo "CUDA_ROOT=${CUDA_ROOT}"; \
+  REAL="$(find "${CUDA_ROOT}" -name 'libcudart.so*' -type f ! -path '*/stubs/*' | sort | tail -n1)"; \
+  echo "REAL_CUDART=${REAL}"; \
+  test -n "${REAL}"; \
+  LIB64="$(readlink -f /usr/local/cuda/lib64 2>/dev/null || true)"; \
+  if [ -z "${LIB64}" ]; then LIB64="${CUDA_ROOT}/lib64"; fi; \
+  mkdir -p "${LIB64}"; \
+  ln -sf "${REAL}" "${LIB64}/libcudart.so"; \
+  arch="$(uname -m)"; \
+  if [ -d "/usr/lib/${arch}-linux-gnu" ]; then \
+    ln -sf "${REAL}" "/usr/lib/${arch}-linux-gnu/libcudart.so"; \
+  fi; \
+  ldconfig
+
+# C++ prebuild
+COPY CPP_Project /opt/src/CPP_Project
+WORKDIR /opt/src
+
+RUN set -eux; \
+  CUDA_STUB="/usr/local/cuda/lib64/stubs/libcuda.so"; \
+  cd CPP_Project/Inference_Time_Tester; \
+  cmake -B build -S . -DCUDA_DRIVER_LIBRARY="${CUDA_STUB}"; \
+  cmake --build build -j"$(nproc)"; \
+  cd ../Feature_Extractor; \
+  cmake -B build -S . -DCUDA_DRIVER_LIBRARY="${CUDA_STUB}"; \
+  cmake --build build -j"$(nproc)"; \
+  mkdir -p /opt/prebuilt/Inference_Time_Tester /opt/prebuilt/Feature_Extractor; \
+  cp -f ../Inference_Time_Tester/build/trt_cpp_infer_time_tester /opt/prebuilt/Inference_Time_Tester/; \
+  cp -f build/trt_feature_extractor /opt/prebuilt/Feature_Extractor/
+
+############################
+# runtime stage
+############################
+FROM ${BASE_IMAGE} AS runtime
+ENV DEBIAN_FRONTEND=noninteractive
+
+# runtime deps (torch/pycuda 실행에 필요한 것들)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-venv python3-pip \
+    libopencv-dev \
+    libopenblas-base libopenmpi-dev libomp-dev \
+    python3-pycuda \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/venv /opt/venv
+COPY --from=build /opt/prebuilt /opt/prebuilt
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENV PATH=/opt/venv/bin:$PATH
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["bash"]
