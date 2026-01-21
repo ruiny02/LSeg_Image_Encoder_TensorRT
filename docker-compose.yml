@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  lseg-x86:
+    profiles: ["x86"]
+    image: ruiny022/lseg-trt:x86-u22.04
+    container_name: lseg-trt-x86
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  lseg-jetson:
+    profiles: ["jetson"]
+    image: ruiny022/lseg-trt:jetson-jp62
+    container_name: lseg-trt-jetson
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
