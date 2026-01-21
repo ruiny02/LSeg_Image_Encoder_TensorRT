@@ -83,9 +83,9 @@ def build_dynamic_engine(onnx_path,
         # 배치도 동적으로: flip 배치=2를 위해 N∈[1,2]
         profile.set_shape(
             input_tensor.name,
-            (1, 3, 256, 256),   # MIN (N=1)  # 32의 배수 권장
-            (1, 3, 384, 384),   # OPT (N=1)
-            (1, 3, 384, 384)    # MAX (N=1)
+            (1, 3, 288, 512),   # MIN (N=1)
+            (1, 3, 288, 512),   # OPT (N=1)
+            (1, 3, 288, 512),   # MAX (N=1)
         )
         config.add_optimization_profile(profile)
 
