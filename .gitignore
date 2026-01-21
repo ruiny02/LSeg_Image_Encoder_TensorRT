@@ -38,3 +38,7 @@ models/weights/
 fewshot_data/
 
 result.txt
+
+
+# skill 관련
+/docs
