@@ -83,15 +83,13 @@ def build_dynamic_engine(onnx_path,
         # 배치도 동적으로: flip 배치=2를 위해 N∈[1,2]
         profile.set_shape(
             input_tensor.name,
-            (1, 3, 256, 256),   # MIN (N=1)  # 32의 배수 권장
-            (1, 3, 384, 384),   # OPT (N=1)
-            (1, 3, 384, 384)    # MAX (N=1)
+            (1, 3, 180, 240),   # MIN  (N=1, H=180, W=240)
+            (2, 3, 360, 480),   # OPT  (N=2, 480x360)
+            (2, 3, 1024, 1024)  # MAX  (N=2)
         )
         config.add_optimization_profile(profile)
 
         serialized = builder.build_serialized_network(network, config)
-        if serialized is None:
-            raise RuntimeError("❌ buildSerializedNetwork returned None (profile/shape constraint violation)")
         engine = trt.Runtime(TRT_LOGGER).deserialize_cuda_engine(serialized)
         with open(engine_path, "wb") as f:
             f.write(engine.serialize())
