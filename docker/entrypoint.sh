@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # (공통) 출력 디렉토리 자동 생성
-mkdir -p /workspace/models/onnx_engines /workspace/models/trt_engines
+mkdir -p /workspace/models/onnx_engines /workspace/models/weights/Resnet /workspace/models/weights/ViT
 
 # (x86 NGC pytorch만) UCX/UCC 충돌 회피 - Jetson에는 보통 /opt/hpcx 없음
 if [ -d /opt/hpcx/ucx/lib ] && [ -d /opt/hpcx/ucc/lib ]; then
