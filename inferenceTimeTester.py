@@ -18,9 +18,9 @@ def run_subprocess(cmd, cwd=None):
     print(f"[CMD] {' '.join(cmd)}")
     subprocess.run(cmd, check=True, cwd=cwd)
 
-# Measure PyTorch GPU inference
-def measure_pytorch_inference_time(net, inp, iterations=100):
-    device = torch.device('cuda')
+# Measure PyTorch inference
+def measure_pytorch_inference_time(net, inp, iterations=100, device_str='cuda'):
+    device = torch.device(device_str if device_str == 'cuda' and torch.cuda.is_available() else 'cpu')
     net.to(device).eval()
     inp = inp.to(device)
     with torch.no_grad(): net(inp)
@@ -97,6 +97,12 @@ def main():
     parser.add_argument('--resize', type=int, default=None)
     parser.add_argument('--trt_workspace', type=int, default=1<<30,
                         help='Workspace in bytes (1<<30=1GiB)')
+    parser.add_argument('--backbones', nargs='+', choices=['ViT','Resnet'], default=['ViT','Resnet'],
+                        help='Which backbones to process (default: ViT Resnet)')
+    parser.add_argument('--skip_pytorch', action='store_true', default=False,
+                        help='Skip PyTorch benchmark to save GPU memory on Jetson')
+    parser.add_argument('--pytorch_device', type=str, choices=['cpu','cuda'], default='cuda',
+                        help='Device for PyTorch benchmark (default cuda; set cpu on Jetson to avoid OOM)')
     # TRT flags
     parser.add_argument('--trt_fp16', dest='trt_fp16', action='store_true', default=True)
     parser.add_argument('--no-trt_fp16', dest='trt_fp16', action='store_false')
@@ -112,7 +118,7 @@ def main():
     args = parser.parse_args()
 
     records = []
-    backbone_list = ['ViT', 'Resnet']
+    backbone_list = args.backbones
 
 
     # 1) 각 백본별 ckpt 개수 * size 개수로 전체 작업 수 계산
@@ -219,7 +225,10 @@ def main():
 
                 height, width = (args.resize, args.resize) if args.resize else (size, size)
                 inp = torch.ones(1,3,height,width)
-                pt_avg, pt_std = measure_pytorch_inference_time(module, inp, args.iterations)
+                if args.skip_pytorch:
+                    pt_avg = pt_std = None
+                else:
+                    pt_avg, pt_std = measure_pytorch_inference_time(module, inp, args.iterations, args.pytorch_device)
                 trt_avg, trt_std = measure_tensorrt_inference_time(engine_file, inp, args.iterations, dynamic=True)
                 print("C++ Inference Benchmark is running...")
                 cpp_avg, cpp_std = run_cpp_benchmark(engine_file, args.iterations, height, width)
@@ -237,12 +246,13 @@ def main():
                 records.append(record)
 
                 # 중간 결과 출력
+                pt_str = "skipped" if pt_avg is None else f"{pt_avg:.1f} ± {pt_std:.1f}ms"
                 print(
                     f">> Appended Record – "
                     f"Backbone = {record['Backbone']} | "
                     f"Checkpoint = {record['Checkpoint']} | "
                     f"Size = {record['Size']} ×  {record['Size']} | "
-                    f"PyTorch = {record['PyTorch Avg(ms)']:.1f} ±  {record['PyTorch Std(ms)']:.1f}ms | "
+                    f"PyTorch = {pt_str} | "
                     f"TRT Py = {record['TRT Python Avg(ms)']:.1f} ±  {record['TRT Python Std(ms)']:.1f}ms | "
                     f"TRT C++ = {record['TRT C++ Avg(ms)']:.1f} ±  {record['TRT C++ Std(ms)']:.1f}ms\n"
                 )
@@ -261,7 +271,10 @@ def main():
     print(pivot.to_string())
 
     print("\n===== Inference Benchmark Summary (Markdown) =====")
-    print(pivot.to_markdown())
+    try:
+        print(pivot.to_markdown())
+    except Exception as e:
+        print(f"(Markdown summary skipped: {e})")
 
 if __name__=='__main__':
     main()

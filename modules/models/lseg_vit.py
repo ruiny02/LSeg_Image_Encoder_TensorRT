@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import timm
@@ -165,8 +166,18 @@ def forward_flex(self, x):
 # ------------------------------
 # Pretrained backbone 생성 함수들 (최소화된 버전)
 # ------------------------------
+def _get_clip_device():
+    # Override via env CLIP_DEVICE=cpu|cuda; default prefers CPU for low-memory export.
+    env = os.getenv("CLIP_DEVICE")
+    if env in ("cpu", "cuda"):
+        return env
+    return "cpu"  # safer default on Jetson during export
+
+
 def _make_pretrained_clip_vitl16_384(pretrained, use_readout="project", hooks=None, enable_attention_hooks=False):
-    clip_pretrained, _ = clip.load("ViT-B/32", device='cuda', jit=False)
+    clip_pretrained = None
+    if pretrained:
+        clip_pretrained, _ = clip.load("ViT-B/32", device=_get_clip_device(), jit=False)
     model = timm.create_model("vit_large_patch16_384", pretrained=pretrained)
     hooks = [5, 11, 17, 23] if hooks is None else hooks
     pretrained = _make_vit_b16_backbone(
@@ -180,7 +191,9 @@ def _make_pretrained_clip_vitl16_384(pretrained, use_readout="project", hooks=No
     return clip_pretrained, pretrained
 
 def _make_pretrained_clipRN50x16_vitl16_384(pretrained, use_readout="project", hooks=None, enable_attention_hooks=False):
-    clip_pretrained, _ = clip.load("RN50x16", device='cuda', jit=False)
+    clip_pretrained = None
+    if pretrained:
+        clip_pretrained, _ = clip.load("RN50x16", device=_get_clip_device(), jit=False)
     model = timm.create_model("vit_large_patch16_384", pretrained=pretrained)
     hooks = [5, 11, 17, 23] if hooks is None else hooks
     pretrained = _make_vit_b16_backbone(
@@ -194,7 +207,9 @@ def _make_pretrained_clipRN50x16_vitl16_384(pretrained, use_readout="project", h
     return clip_pretrained, pretrained
 
 def _make_pretrained_clip_vitb32_384(pretrained, use_readout="project", hooks=None, enable_attention_hooks=False):
-    clip_pretrained, _ = clip.load("ViT-B/32", device='cuda', jit=False)
+    clip_pretrained = None
+    if pretrained:
+        clip_pretrained, _ = clip.load("ViT-B/32", device=_get_clip_device(), jit=False)
     model = timm.create_model("vit_base_patch32_384", pretrained=pretrained)
     hooks = [2, 5, 8, 11] if hooks is None else hooks
     pretrained = _make_vit_b32_backbone(
