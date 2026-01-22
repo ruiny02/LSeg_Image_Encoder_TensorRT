@@ -19,6 +19,252 @@ You can subsequently use the TRT conversion script (`conversion/onnx_to_trt.py`)
 
 ---
 
+## Real-time USB camera demo (X11 window) + overlay + benchmark
+
+This repo now includes **Docker-first** real-time scripts that:
+
+* capture frames from a USB webcam using **GStreamer**
+* preprocess to a fixed network input size: **(1,3,288,512)**
+* run the LSeg image encoder with either:
+  * **TensorRT** (`--backend trt`, default) or
+  * **PyTorch** (`--backend torch`)
+* compute a per-pixel label mask using CLIP text embeddings (cosine similarity)
+* show a window with **alpha-blended overlay**, optional **legend**, and FPS
+* print a **console benchmark** (encoder ms + total ms + FPS)
+
+Real-time scripts:
+
+* `realtime/lseg_realtime.py`  
+  One-run demo + overlay + benchmark output.
+* `realtime/compare_backends.py`  
+  Runs `torch` then `trt` sequentially (same camera/settings) and prints both logs.
+* `realtime/bench_all_weights.py`  
+  Recursively finds all `*.ckpt` under `models/weights/` and benchmarks all of them.
+
+> NOTE (Jetson): **TensorRT engines must be built on the Jetson itself** (GPU/driver/TensorRT-version specific).
+
+---
+
+## 1) X86 (Ubuntu 22.04 + RTX 4050) – from scratch
+
+### 1.1 Prerequisites on host
+
+* Docker + NVIDIA Container Toolkit installed (so `docker run --gpus all ...` works)
+* X11 running on the host (you said both are X11)
+* USB webcam available at:
+  * **x86:** `/dev/video4` (Logitech, 1280×720)
+
+### 1.2 Put your checkpoints
+
+Place your **3 checkpoints** anywhere under:
+
+* `models/weights/ViT/*.ckpt` or
+* `models/weights/Resnet/*.ckpt`
+
+The real-time scripts will auto-detect `vit` vs `rn101` by file path/name.
+
+### 1.3 Build the x86 docker image
+
+You are using NGC base images. Log in once:
+
+```bash
+docker login nvcr.io
+```
+
+Build:
+
+```bash
+cd lseg_image_clean
+
+docker build \
+  -f Dockerfile.x86 \
+  -t ruiny022/lseg-trt:x86-u22.04 \
+  .
+```
+
+### 1.4 Run the container (X11 + webcam)
+
+On the **host**:
+
+```bash
+# allow docker (root) to access your X11 display
+xhost +local:root
+```
+
+Run container:
+
+```bash
+cd lseg_image_clean
+
+docker run --rm -it \
+  --gpus all \
+  --net=host \
+  --privileged \
+  -e DISPLAY=$DISPLAY \
+  -e QT_X11_NO_MITSHM=1 \
+  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+  -v $PWD:/workspace \
+  -v $HOME/.cache:/root/.cache \
+  --device /dev/video4:/dev/video4 \
+  ruiny022/lseg-trt:x86-u22.04
+```
+
+### 1.5 Real-time demo (TensorRT)
+
+Inside the container:
+
+```bash
+python3 realtime/lseg_realtime.py \
+  --device /dev/video4 \
+  --backend trt \
+  --weights models/weights/ViT/<YOUR_CKPT>.ckpt \
+  --labels "person, chair, desk, monitor, keyboard, background"
+```
+
+* Press **q** (or **ESC**) to quit.
+* At exit, it prints a benchmark block to the console.
+
+### 1.6 Baseline demo (PyTorch) and compare
+
+PyTorch baseline:
+
+```bash
+python3 realtime/lseg_realtime.py \
+  --device /dev/video4 \
+  --backend torch \
+  --weights models/weights/ViT/<YOUR_CKPT>.ckpt \
+  --labels "person, chair, desk, monitor, keyboard, background"
+```
+
+Compare in one command (recommended for benchmarking):
+
+```bash
+python3 realtime/compare_backends.py \
+  --device /dev/video4 \
+  --weights models/weights/ViT/<YOUR_CKPT>.ckpt \
+  --labels "person, chair, desk, monitor, keyboard, background" \
+  --no_display
+```
+
+### 1.7 Benchmark all checkpoints (your 3 ckpts)
+
+```bash
+python3 realtime/bench_all_weights.py \
+  --weights_dir models/weights \
+  --device /dev/video4 \
+  --no_display \
+  --frames 300 \
+  --warmup 30
+```
+
+---
+
+## 2) Jetson Orin Nano (JetPack 6.2) – reproduce x86 result
+
+### 2.1 Note on base images (l4t-jetpack vs l4t-tensorrt)
+
+* `nvcr.io/nvidia/l4t-jetpack` is a "full" base that includes CUDA/cuDNN/TensorRT **plus** Jetson multimedia stack.
+* `nvcr.io/nvidia/l4t-tensorrt` is a TensorRT-runtime-focused base image.
+
+For **USB camera + OpenCV(GStreamer) + X11 window**, `l4t-jetpack` is usually the simpler starting point.
+
+JetPack 6.2 / Jetson Linux 36.4.x compute stack includes TensorRT 10.3 (CUDA 12.6).
+
+### 2.2 Build the Jetson docker image (on the Jetson)
+
+On the Jetson:
+
+```bash
+docker login nvcr.io
+
+cd lseg_image_clean
+
+docker build \
+  -f Dockerfile.jetson \
+  -t ruiny022/lseg-trt:jetson-jp62 \
+  .
+```
+
+### 2.3 Run the container (X11 + /dev/video0)
+
+On the Jetson **host**:
+
+```bash
+xhost +local:root
+```
+
+Run container:
+
+```bash
+cd lseg_image_clean
+
+docker run --rm -it \
+  --runtime nvidia \
+  --net=host \
+  --privileged \
+  -e DISPLAY=$DISPLAY \
+  -e QT_X11_NO_MITSHM=1 \
+  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+  -v $PWD:/workspace \
+  -v $HOME/.cache:/root/.cache \
+  --device /dev/video0:/dev/video0 \
+  ruiny022/lseg-trt:jetson-jp62
+```
+
+### 2.4 Build TRT engine on the Jetson (FP16)
+
+Inside the Jetson container:
+
+```bash
+python3 conversion/model_to_onnx.py --weights models/weights/ViT/<YOUR_CKPT>.ckpt
+
+python3 conversion/onnx_to_trt.py \
+  --onnx models/onnx_engines/lseg_img_enc_vit_<YOUR_CKPT_TAG>.onnx \
+  --fp16 \
+  --min_hw 288 512 --opt_hw 288 512 --max_hw 288 512 \
+  --workspace $((1<<30))
+```
+
+### 2.5 Run real-time demo on Jetson
+
+```bash
+python3 realtime/lseg_realtime.py \
+  --device /dev/video0 \
+  --backend trt \
+  --weights models/weights/ViT/<YOUR_CKPT>.ckpt \
+  --labels "person, chair, desk, monitor, keyboard, background"
+```
+
+---
+
+## INT8 (optional)
+
+INT8 requires calibration images.
+
+Example:
+
+```bash
+python3 conversion/onnx_to_trt.py \
+  --onnx models/onnx_engines/lseg_img_enc_vit_<TAG>.onnx \
+  --int8 --fp16 \
+  --calib_dir calib_images \
+  --min_hw 288 512 --opt_hw 288 512 --max_hw 288 512 \
+  --workspace $((1<<30))
+```
+
+Put a few hundred jpg/png images under `calib_images/` (you can just capture webcam frames). The script will create a calibration cache under `models/trt_engines/`.
+
+You can capture webcam frames like this:
+
+```bash
+# x86 (Logitech at /dev/video4)
+python3 tools/capture_calib_images.py --device /dev/video4 --out_dir calib_images --count 300
+
+# Jetson (/dev/video0)
+python3 tools/capture_calib_images.py --device /dev/video0 --out_dir calib_images --count 300
+```
+
+
 ## 0. TL;DR  (run everything)
 
 ```bash

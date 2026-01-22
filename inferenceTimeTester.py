@@ -149,25 +149,44 @@ def main():
                 run_subprocess(['python3', onnx_script, '--weights', ckpt])
             # TRT build
             trt_dir = os.path.join('models','trt_engines'); os.makedirs(trt_dir, exist_ok=True)
+            # NOTE: conversion/onnx_to_trt.py now supports explicit (min/opt/max) profiles and
+            # includes them in the engine filename.
+            sizes_for_profile = [args.resize] if args.resize else list(args.img_sizes)
+            min_size = int(min(sizes_for_profile))
+            max_size = int(max(sizes_for_profile))
+            sorted_sizes = sorted(sizes_for_profile)
+            opt_size = int(sorted_sizes[len(sorted_sizes)//2])
+
+            prec_tag = 'fp16' if args.trt_fp16 else 'fp32'
             flags = [
-                'fp16' if args.trt_fp16 else 'fp32',
-                'sparse' if args.trt_sparse else 'nosparse',
-                'noTC' if args.trt_no_tc else 'tc',
-                'gpuFB' if args.trt_gpu_fb else 'nogpuFB',
-                'dbg' if args.trt_debug else 'nodebug',
-                'cublas' if args.trt_cublas else 'nocublas',
-                'cudnn' if args.trt_cudnn else 'nocudnn',
-                f"ws{args.trt_workspace>>20}MiB"
+                prec_tag,
+                'sparse' if args.trt_sparse else None,
+                'noTC' if args.trt_no_tc else None,
+                'gpuFB' if args.trt_gpu_fb else None,
+                'dbg' if args.trt_debug else None,
+                'cublas' if args.trt_cublas else None,
+                'cudnn' if args.trt_cudnn else None,
+                f"min{min_size}x{min_size}",
+                f"opt{opt_size}x{opt_size}",
+                f"max{max_size}x{max_size}",
+                f"ws{args.trt_workspace>>20}MiB",
             ]
-            suffix = '_'.join(flags)
+            suffix = '_'.join([f for f in flags if f])
             engine_file = find_engine_file(trt_dir, base, suffix)
             if engine_file:
                 print(f"✅ TRT engine exists, skip: {engine_file}")
             else:
                 print(f"Building TRT engine: {base}__{suffix}.trt")
-                cmd = ['python3', 'conversion/onnx_to_trt.py', '--onnx', onnx_path, '--workspace', str(args.trt_workspace)]
-                cmd += ['--fp16'] if args.trt_fp16 else ['--no-trt_fp16']
-                cmd += ['--sparse'] if args.trt_sparse else ['--no-trt_sparse']
+                cmd = [
+                    'python3', 'conversion/onnx_to_trt.py',
+                    '--onnx', onnx_path,
+                    '--workspace', str(args.trt_workspace),
+                    '--min_hw', str(min_size), str(min_size),
+                    '--opt_hw', str(opt_size), str(opt_size),
+                    '--max_hw', str(max_size), str(max_size),
+                ]
+                cmd += ['--fp16'] if args.trt_fp16 else ['--no-fp16']
+                cmd += ['--sparse'] if args.trt_sparse else ['--no-sparse']
                 if args.trt_no_tc: cmd.append('--disable-timing-cache')
                 if args.trt_gpu_fb: cmd.append('--gpu-fallback')
                 if args.trt_debug: cmd.append('--debug')
