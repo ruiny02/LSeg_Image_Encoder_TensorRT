@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 from .lseg_vit_zs import _make_pretrained_clip_rn101
@@ -14,6 +15,10 @@ def _make_encoder(
     use_readout="ignore",
     enable_attention_hooks=False,
 ):
+    env_use_pretrained = os.getenv("USE_PRETRAINED")
+    if env_use_pretrained is not None:
+        use_pretrained = env_use_pretrained not in ("0", "false", "False")
+
     if backbone == "clip_resnet101":
         clip_pretrained, pretrained = _make_pretrained_clip_rn101(
             use_pretrained,

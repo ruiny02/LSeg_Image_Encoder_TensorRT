@@ -14,7 +14,10 @@ def build_dynamic_engine(onnx_path,
                          use_sparse: bool,
                          use_cublas: bool,
                          use_cudnn: bool,
-                         workspace_size: int):
+                         workspace_size: int,
+                         min_shape,
+                         opt_shape,
+                         max_shape):
     with trt.Builder(TRT_LOGGER) as builder, \
          builder.create_network(EXPLICIT_BATCH) as network, \
          trt.OnnxParser(network, TRT_LOGGER) as parser, \
@@ -77,15 +80,12 @@ def build_dynamic_engine(onnx_path,
 
         input_tensor = network.get_input(0)
         profile = builder.create_optimization_profile()
-        # Scannet 원본 encode_images.py 입력과 동일 범위를 보장:
-        #  base 320x240 × 0.75 → 240x180 까지 허용
-        #  (N,C,H,W) = (1,3,180,240) .. (1,3,1024,1024)
-        # 배치도 동적으로: flip 배치=2를 위해 N∈[1,2]
+        # Dynamic profile: default 256~1024 square; can be overridden via CLI for Jetson
         profile.set_shape(
             input_tensor.name,
-            (1, 3, 288, 512),   # MIN (N=1)
-            (1, 3, 288, 512),   # OPT (N=1)
-            (1, 3, 288, 512),   # MAX (N=1)
+            (1, 3, min_shape, min_shape),   # MIN
+            (1, 3, opt_shape, opt_shape),   # OPT
+            (1, 3, max_shape, max_shape),   # MAX
         )
         config.add_optimization_profile(profile)
 
@@ -146,6 +146,12 @@ if __name__ == "__main__":
     # ─── Debug & profiling ───────────────────────────────────────
     parser.add_argument("--debug",               action="store_true", default=False,
                         help="Enable debug mode")
+    parser.add_argument("--min-size", type=int, default=256,
+                        help="Dynamic profile MIN spatial size (default 256)")
+    parser.add_argument("--opt-size", type=int, default=384,
+                        help="Dynamic profile OPT spatial size (default 384)")
+    parser.add_argument("--max-size", type=int, default=1024,
+                        help="Dynamic profile MAX spatial size (default 1024)")
 
     args = parser.parse_args()
 
@@ -185,7 +191,10 @@ if __name__ == "__main__":
         use_sparse             = args.sparse,
         use_cublas           = args.use_cublas,
         use_cudnn            = args.use_cudnn,
-        workspace_size         = args.workspace
+        workspace_size         = args.workspace,
+        min_shape              = args.min_size,
+        opt_shape              = args.opt_size,
+        max_shape              = args.max_size
     )
 
     print(f"\n✅ Engine saved as: {engine_path}")

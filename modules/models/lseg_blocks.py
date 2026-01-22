@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 
@@ -20,6 +21,11 @@ def _make_encoder(
     use_readout="project",
     enable_attention_hooks=False,
 ):  
+    # 환경변수 USE_PRETRAINED=0 로 설정하면 사전학습 가중치 로드를 생략해 메모리 사용을 낮춘다.
+    env_use_pretrained = os.getenv("USE_PRETRAINED")
+    if env_use_pretrained is not None:
+        use_pretrained = env_use_pretrained not in ("0", "false", "False")
+
     if backbone == "clip_vitl16_384": 
         clip_pretrained, pretrained = _make_pretrained_clip_vitl16_384(
             use_pretrained,

@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import timm
@@ -205,9 +206,18 @@ def _make_resnet_backbone(resnet):
     pretrained.layer4 = resnet.layer4
     return pretrained
 
+def _get_clip_device():
+    env = os.getenv("CLIP_DEVICE")
+    if env in ("cpu", "cuda"):
+        return env
+    return "cpu"
+
+
 def _make_pretrained_clip_rn101(use_pretrained):
-    # CLIP 모델 로드 (예: ViT-B/32를 사용하지만, 실제로는 ResNet101용 CLIP 모델 사용)
-    clip_pretrained, _ = clip.load("ViT-B/32", device='cuda', jit=False)
+    # CLIP 모델 로드 (ResNet101용) — 사전학습 생략 시 None으로 두어 메모리 절약
+    clip_pretrained = None
+    if use_pretrained:
+        clip_pretrained, _ = clip.load("ViT-B/32", device=_get_clip_device(), jit=False)
     resnet = models.resnet101(pretrained=use_pretrained)
     pretrained = _make_resnet_backbone(resnet)
     return clip_pretrained, pretrained
