@@ -33,20 +33,24 @@ ENV PATH=/opt/venv/bin:$PATH
 RUN python3 -m pip install --upgrade pip setuptools wheel
 
 # --------------------------
-# (중요) JetPack 6.2용 PyTorch 설치
-# - JetPack 6.2: CUDA 12.6 / TRT 10.3 기반에 맞는 wheel 인덱스 사용
-# - 또한 cuSPARSELt가 없으면 torch import 시 libcusparseLt.so 이슈가 날 수 있어 미리 설치
+# cuSPARSELt (Jetson/tegra용 설치)
+# - install_cusparselt.sh는 CUDA 12.6에서 실패하는 케이스가 있어,
+#   tegra local repo deb로 설치
 # --------------------------
 RUN set -eux; \
-  if [ ! -f /usr/local/cuda/lib64/libcusparseLt.so ]; then \
-    echo "[INFO] Installing cuSPARSELt (needed by recent PyTorch wheels)"; \
-    wget -q https://raw.githubusercontent.com/pytorch/pytorch/5c6af2b583709f6176898c017424dc9981023c28/.ci/docker/common/install_cusparselt.sh \
-      -O /tmp/install_cusparselt.sh; \
-    chmod +x /tmp/install_cusparselt.sh; \
-    export CUDA_VERSION=12.6; \
-    bash /tmp/install_cusparselt.sh; \
-    rm -f /tmp/install_cusparselt.sh; \
-  fi
+  if [ ! -f /usr/local/cuda/lib64/libcusparseLt.so ] && [ ! -f /usr/local/cuda/lib64/libcusparseLt.so.0 ]; then \
+    CUSP_VER=0.7.0; \
+    wget -q https://developer.download.nvidia.com/compute/cusparselt/${CUSP_VER}/local_installers/cusparselt-local-tegra-repo-ubuntu2204-${CUSP_VER}_1.0-1_arm64.deb \
+      -O /tmp/cusparselt.deb; \
+    dpkg -i /tmp/cusparselt.deb; \
+    cp /var/cusparselt-local-tegra-repo-ubuntu2204-${CUSP_VER}/cusparselt-*-keyring.gpg /usr/share/keyrings/; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends libcusparselt0 libcusparselt-dev; \
+    rm -f /tmp/cusparselt.deb; \
+    ldconfig; \
+  fi; \
+  ls -l /usr/local/cuda/lib64/libcusparseLt.so* || true; \
+  ldconfig -p | grep -i cusparseLt || true
 
 # JetPack 6.2용 torch/torchvision (JPL index)
 RUN python3 -m pip install --no-cache-dir \
