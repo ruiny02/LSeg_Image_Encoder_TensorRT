@@ -251,12 +251,18 @@ def build_engine(
             config.int8_calibrator = calibrator
 
         # Tactic sources
+        # NOTE: Calling set_tactic_sources() restricts TensorRT to ONLY the specified sources.
+        # Transformer blocks often need CUBLAS_LT; without it you can hit
+        #   'Could not find any implementation for node ...'
         tactic_mask = 0
         if use_cublas:
             tactic_mask |= 1 << int(trt.TacticSource.CUBLAS)
+            if hasattr(trt.TacticSource, 'CUBLAS_LT'):
+                tactic_mask |= 1 << int(trt.TacticSource.CUBLAS_LT)
         if use_cudnn:
             tactic_mask |= 1 << int(trt.TacticSource.CUDNN)
-        config.set_tactic_sources(tactic_mask)
+        if tactic_mask:
+            config.set_tactic_sources(tactic_mask)
 
         # Parse ONNX
         print(f"🔍 parsing ONNX: {onnx_path}")

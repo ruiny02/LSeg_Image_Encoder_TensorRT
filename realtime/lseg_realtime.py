@@ -240,13 +240,23 @@ def ensure_onnx_and_engine(
     else:
         print(f"[ONNX] exists : {onnx_path}")
 
+    # Select ONNX precision for TRT build (Jetson memory saver: FP16 initializers)
+    onnx_for_trt = onnx_path
+    if fp16 or int8:
+        onnx_fp16_path = f"models/onnx_engines/{base}_fp16.onnx"
+        # Rebuild fp16 ONNX if missing or older than the fp32 ONNX
+        if (not os.path.exists(onnx_fp16_path)) or (os.path.getmtime(onnx_fp16_path) < os.path.getmtime(onnx_path)):
+            print(f"[ONNX] converting to FP16: {onnx_fp16_path}")
+            subprocess.run(["python3", "conversion/onnx_fp16.py", "--input", onnx_path, "--output", onnx_fp16_path], check=True)
+        onnx_for_trt = onnx_fp16_path
+
     # TRT engine
     in_h, in_w = input_hw
     trt_cmd = [
         "python3",
         "conversion/onnx_to_trt.py",
         "--onnx",
-        onnx_path,
+        onnx_for_trt,
         "--workspace",
         str(int(workspace)),
         "--min_hw",
