@@ -88,22 +88,38 @@ RUN set -eux; \
   mkdir -p "${LIB64}"; \
   ln -sf "${REAL}" "${LIB64}/libcudart.so"; \
   ldconfig
+  
+# --------------------------
+# C++ prebuild (Jetson 주의)
+# - Jetson은 docker build 단계에서 nvidia runtime 마운트가 없어
+#   libnvinfer.so가 의존하는 DLA/cuDLA 라이브러리(libnvdla_compiler.so, libnvcudla.so 등)가
+#   보이지 않아 링크가 깨질 수 있음.
+# - 기본(BUILD_CPP=0)은 스킵하고, 컨테이너 실행 후(runtime) 빌드를 권장.
+# - 정말 이미지 빌드 단계에서 하고 싶으면: docker build --build-arg BUILD_CPP=1 ...
+# --------------------------
+ARG BUILD_CPP=0
 
-# C++ prebuild (docker build 시점에는 GPU 드라이버가 없을 수 있으므로 stub로 링크)
+# prebuilt 디렉토리는 항상 생성 (runtime stage COPY/사용 편의)
+RUN mkdir -p /opt/prebuilt/Inference_Time_Tester /opt/prebuilt/Feature_Extractor
+
 COPY CPP_Project /opt/src/CPP_Project
 WORKDIR /opt/src
 
 RUN set -eux; \
-  CUDA_STUB="/usr/local/cuda/lib64/stubs/libcuda.so"; \
-  cd CPP_Project/Inference_Time_Tester; \
-  cmake -B build -S . -DCUDA_DRIVER_LIBRARY="${CUDA_STUB}"; \
-  cmake --build build -j"$(nproc)"; \
-  cd ../Feature_Extractor; \
-  cmake -B build -S . -DCUDA_DRIVER_LIBRARY="${CUDA_STUB}"; \
-  cmake --build build -j"$(nproc)"; \
-  mkdir -p /opt/prebuilt/Inference_Time_Tester /opt/prebuilt/Feature_Extractor; \
-  cp -f ../Inference_Time_Tester/build/trt_cpp_infer_time_tester /opt/prebuilt/Inference_Time_Tester/; \
-  cp -f build/trt_feature_extractor /opt/prebuilt/Feature_Extractor/
+  if [ "${BUILD_CPP}" = "1" ]; then \
+    echo "[CPP] Building C++ binaries in docker build stage (may fail on Jetson without runtime mounts)"; \
+    CUDA_STUB="/usr/local/cuda/lib64/stubs/libcuda.so"; \
+    cd CPP_Project/Inference_Time_Tester; \
+    cmake -B build -S . -DCUDA_DRIVER_LIBRARY="${CUDA_STUB}" || cmake -B build -S .; \
+    cmake --build build -j"$(nproc)"; \
+    cd ../Feature_Extractor; \
+    cmake -B build -S . -DCUDA_DRIVER_LIBRARY="${CUDA_STUB}" || cmake -B build -S .; \
+    cmake --build build -j"$(nproc)"; \
+    cp -f ../Inference_Time_Tester/build/trt_cpp_infer_time_tester /opt/prebuilt/Inference_Time_Tester/; \
+    cp -f build/trt_feature_extractor /opt/prebuilt/Feature_Extractor/; \
+  else \
+    echo "[CPP] Skipping C++ build at docker build time (recommended on Jetson). Build at runtime instead."; \
+  fi
 
 ############################
 # runtime stage
