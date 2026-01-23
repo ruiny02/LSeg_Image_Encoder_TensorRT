@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 
-ARG BASE_IMAGE=nvcr.io/nvidia/l4t-jetpack:r36.4.0
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.08-py3
 
 ############################
 # build stage
@@ -8,11 +8,11 @@ ARG BASE_IMAGE=nvcr.io/nvidia/l4t-jetpack:r36.4.0
 FROM ${BASE_IMAGE} AS build
 ENV DEBIAN_FRONTEND=noninteractive
 
-# apt deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-venv python3-dev python3-pip \
+    python3-venv python3-dev python3-pip \
     build-essential cmake git wget curl pkg-config \
-    zlib1g-dev libopencv-dev python3-opencv \
+    zlib1g-dev \
+    libopencv-dev python3-opencv \
     libgl1 libglib2.0-0 \
     libxext6 libxrender1 libsm6 \
     libgtk-3-0 libcanberra-gtk3-module \
@@ -23,39 +23,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gstreamer1.0-plugins-bad \
     gstreamer1.0-plugins-ugly \
     gstreamer1.0-libav \
-    libopenblas-base libopenmpi-dev libomp-dev \
-    python3-pycuda \
+    gstreamer1.0-x \
+    gstreamer1.0-gl \
   && rm -rf /var/lib/apt/lists/*
 
-# venv (TensorRT/python3-pycuda는 시스템에 있으므로 system-site-packages)
 RUN python3 -m venv --system-site-packages /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
 RUN python3 -m pip install --upgrade pip setuptools wheel
 
-# Jetson PyTorch wheels (JP6 / CUDA12.6 / Python3.10)
-# NVIDIA 포럼에서 안내한 wheel 경로 기반 (numpy<2 선행 권장) :contentReference[oaicite:6]{index=6}
-RUN python3 -m pip install --no-cache-dir "numpy<2"
+COPY requirements/requirements.x86.txt /tmp/requirements.x86.txt
+RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.x86.txt
 
-ARG JPL_BASE=https://pypi.jetson-ai-lab.io/jp6/cu126
-ARG JPL_FALLBACK=https://pypi.jetson-ai-lab.dev/jp6/cu126
-
-ARG TORCH_WHL=+f/6cc/6ecfe8a5994fd/torch-2.6.0-cp310-cp310-linux_aarch64.whl
-ARG TV_WHL=+f/aa2/2da8dcf4c4c8d/torchvision-0.21.0-cp310-cp310-linux_aarch64.whl
-ARG TA_WHL=+f/dda/ce98dc7d89263/torchaudio-2.6.0-cp310-cp310-linux_aarch64.whl
-
+# ★중요: pip cv2 제거 + GStreamer=YES 확인
 RUN set -eux; \
-  (wget -O /tmp/torch.whl      "${JPL_BASE}/${TORCH_WHL}" || wget -O /tmp/torch.whl      "${JPL_FALLBACK}/${TORCH_WHL}"); \
-  (wget -O /tmp/torchvision.whl "${JPL_BASE}/${TV_WHL}"   || wget -O /tmp/torchvision.whl "${JPL_FALLBACK}/${TV_WHL}"); \
-  (wget -O /tmp/torchaudio.whl  "${JPL_BASE}/${TA_WHL}"   || wget -O /tmp/torchaudio.whl  "${JPL_FALLBACK}/${TA_WHL}"); \
-  python3 -m pip install --no-cache-dir --force-reinstall --no-cache-dir \
-    /tmp/torch.whl /tmp/torchvision.whl /tmp/torchaudio.whl; \
-  rm -f /tmp/*.whl
+  python3 -m pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless || true; \
+  rm -rf /usr/local/lib/python*/dist-packages/cv2 /usr/local/lib/python*/dist-packages/cv2-*.dist-info /usr/local/lib/python*/dist-packages/opencv* || true; \
+  rm -rf /opt/venv/lib/python*/site-packages/cv2 /opt/venv/lib/python*/site-packages/cv2-*.dist-info /opt/venv/lib/python*/site-packages/opencv* || true; \
+  python3 -c 'import cv2; print("cv2 =", cv2.__file__); print(next(l for l in cv2.getBuildInformation().splitlines() if "GStreamer" in l))'
 
-# 파이썬 deps (Jetson 전용)
-COPY requirements/requirements.jetson.txt /tmp/requirements.jetson.txt
-RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.jetson.txt
-
-# (수정) libcudart 위치 탐색 시 /usr/local/cuda 심링크를 따라가도록 수정
 RUN set -eux; \
   CUDA_ROOT="$(readlink -f /usr/local/cuda || echo /usr/local/cuda)"; \
   echo "CUDA_ROOT=${CUDA_ROOT}"; \
@@ -72,7 +57,6 @@ RUN set -eux; \
   fi; \
   ldconfig
 
-# C++ prebuild
 COPY CPP_Project /opt/src/CPP_Project
 WORKDIR /opt/src
 
@@ -94,9 +78,8 @@ RUN set -eux; \
 FROM ${BASE_IMAGE} AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
-# runtime deps (torch/pycuda 실행에 필요한 것들)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-venv python3-pip \
+    python3-venv python3-pip \
     libopencv-dev python3-opencv \
     libgl1 libglib2.0-0 \
     libxext6 libxrender1 libsm6 \
@@ -108,8 +91,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gstreamer1.0-plugins-bad \
     gstreamer1.0-plugins-ugly \
     gstreamer1.0-libav \
-    libopenblas-base libopenmpi-dev libomp-dev \
-    python3-pycuda \
+    gstreamer1.0-x \
+    gstreamer1.0-gl \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/venv /opt/venv
@@ -118,6 +101,17 @@ COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENV PATH=/opt/venv/bin:$PATH
+
+# ★중요: runtime에도 최종 제거 + 확인
+RUN set -eux; \
+  python3 -m pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless || true; \
+  rm -rf /usr/local/lib/python*/dist-packages/cv2 /usr/local/lib/python*/dist-packages/cv2-*.dist-info /usr/local/lib/python*/dist-packages/opencv* || true; \
+  rm -rf /opt/venv/lib/python*/site-packages/cv2 /opt/venv/lib/python*/site-packages/cv2-*.dist-info /opt/venv/lib/python*/site-packages/opencv* || true; \
+  python3 -c 'import cv2; print("cv2 =", cv2.__file__); print(next(l for l in cv2.getBuildInformation().splitlines() if "GStreamer" in l))'
+
+ENV PYTHONPATH=/workspace
+ENV QT_X11_NO_MITSHM=1
+
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["bash"]
