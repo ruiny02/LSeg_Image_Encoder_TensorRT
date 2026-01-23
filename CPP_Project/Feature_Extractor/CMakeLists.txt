@@ -10,6 +10,14 @@ find_package(CUDA REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(ZLIB REQUIRED)
 
+# (추가) Jetson에서 cudart 경로가 /usr/local/cuda/targets/... 인 경우 대비
+if (EXISTS "/usr/local/cuda/targets/aarch64-linux/lib")
+  link_directories("/usr/local/cuda/targets/aarch64-linux/lib")
+endif()
+if (EXISTS "/usr/local/cuda/lib64")
+  link_directories("/usr/local/cuda/lib64")
+endif()
+
 # 3) include 경로
 include_directories(
     ${CUDA_INCLUDE_DIRS}
