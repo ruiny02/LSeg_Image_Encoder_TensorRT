@@ -42,3 +42,8 @@ result.txt
 
 # skill 관련
 /docs
+
+
+
+# inferenceTimeTester 로그
+logs/

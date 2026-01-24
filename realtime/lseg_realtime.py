@@ -20,10 +20,12 @@ Notes
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import subprocess
 import time
 from dataclasses import dataclass
+from collections import deque
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -452,7 +454,7 @@ def load_torch_encoder(weights: str, backbone: str) -> torch.nn.Module:
     else:
         raise ValueError(f"Unsupported backbone: {backbone}")
 
-    net.eval().cuda()
+    net.eval()
     return net
 
 
@@ -463,6 +465,7 @@ def compute_mask_from_features(
     *,
     out_hw: Optional[Tuple[int, int]] = None,
     eps: float = 1e-6,
+    mask_device: str = "cuda",
 ) -> torch.Tensor:
     """Return argmax mask on GPU with shape (Hf, Wf).
 
@@ -470,10 +473,14 @@ def compute_mask_from_features(
       * LSeg-style inference uses cosine similarity between per-pixel embeddings and text embeddings.
       * Some exported / TensorRT engines may output FP16 tensors; we upcast + re-normalize for stability.
     """
-    if image_features.dtype != torch.float32:
-        image_features = image_features.float()
-    if text_features.dtype != torch.float32:
-        text_features = text_features.float()
+    if mask_device == "cpu":
+        image_features = image_features.to("cpu", dtype=torch.float32, non_blocking=True)
+        text_features = text_features.to("cpu", dtype=torch.float32, non_blocking=True)
+    else:
+        if image_features.dtype != torch.float32:
+            image_features = image_features.float()
+        if text_features.dtype != torch.float32:
+            text_features = text_features.float()
 
     # Ensure contiguous for einsum/matmul
     if not image_features.is_contiguous():
@@ -520,9 +527,17 @@ class Stats:
     encoder_ms: List[float]
     total_ms: List[float]
 
+    # keep a rolling window for mid-run reports
+    enc_window: deque = None  # type: ignore
+    tot_window: deque = None  # type: ignore
+
     def add(self, encoder_ms: float, total_ms: float) -> None:
         self.encoder_ms.append(float(encoder_ms))
         self.total_ms.append(float(total_ms))
+        if self.enc_window is not None:
+            self.enc_window.append(float(encoder_ms))
+            self.tot_window.append(float(total_ms))
+            # limit window size handled by caller
 
     def summary(self) -> dict:
         enc = np.array(self.encoder_ms, dtype=np.float64)
@@ -540,6 +555,28 @@ class Stats:
             out["fps"] = float("nan")
         return out
 
+    def window_summary(self) -> dict:
+        if self.enc_window is None or len(self.enc_window) == 0:
+            return {
+                "frames": 0,
+                "enc_avg_ms": float("nan"),
+                "enc_std_ms": float("nan"),
+                "tot_avg_ms": float("nan"),
+                "tot_std_ms": float("nan"),
+                "fps": float("nan"),
+            }
+        enc = np.array(self.enc_window, dtype=np.float64)
+        tot = np.array(self.tot_window, dtype=np.float64)
+        out = {
+            "frames": len(enc),
+            "enc_avg_ms": float(enc.mean()),
+            "enc_std_ms": float(enc.std()),
+            "tot_avg_ms": float(tot.mean()),
+            "tot_std_ms": float(tot.std()),
+        }
+        out["fps"] = 1000.0 / out["tot_avg_ms"] if out["tot_avg_ms"] > 0 else float("nan")
+        return out
+
 
 def print_stats(
     *,
@@ -550,22 +587,29 @@ def print_stats(
     cam_hw: Tuple[int, int],
     labels: Sequence[str],
     stats: Stats,
+    log_fn,
 ) -> None:
     s = stats.summary()
-    print("\n==================== BENCHMARK ====================")
-    print(f"[INFO] backend     : {backend}")
-    print(f"[INFO] weights     : {weights}")
+    lines = [
+        "\n==================== BENCHMARK ====================",
+        f"[INFO] backend     : {backend}",
+        f"[INFO] weights     : {weights}",
+    ]
     if engine:
-        print(f"[INFO] engine      : {engine}")
-    print(f"[INFO] camera_hw   : {cam_hw[0]}x{cam_hw[1]}")
-    print(f"[INFO] input_hw    : {input_hw[0]}x{input_hw[1]}  (NCHW=1,3,H,W)")
-    print(f"[INFO] labels({len(labels)}): {', '.join(labels)}")
-    print(f"[INFO] warmup      : {stats.warmup} frames")
-    print(f"[INFO] measured    : {s['frames']} frames")
-    print("---------------------------------------------------")
-    print(f"[RESULT] Encoder : Avg={s['enc_avg_ms']:.3f} ms ± {s['enc_std_ms']:.3f} ms")
-    print(f"[RESULT] Total   : Avg={s['tot_avg_ms']:.3f} ms ± {s['tot_std_ms']:.3f} ms   (FPS={s['fps']:.2f})")
-    print("===================================================\n")
+        lines.append(f"[INFO] engine      : {engine}")
+    lines += [
+        f"[INFO] camera_hw   : {cam_hw[0]}x{cam_hw[1]}",
+        f"[INFO] input_hw    : {input_hw[0]}x{input_hw[1]}  (NCHW=1,3,H,W)",
+        f"[INFO] labels({len(labels)}): {', '.join(labels)}",
+        f"[INFO] warmup      : {stats.warmup} frames",
+        f"[INFO] measured    : {s['frames']} frames",
+        "---------------------------------------------------",
+        f"[RESULT] Encoder : Avg={s['enc_avg_ms']:.3f} ms ± {s['enc_std_ms']:.3f} ms",
+        f"[RESULT] Total   : Avg={s['tot_avg_ms']:.3f} ms ± {s['tot_std_ms']:.3f} ms   (FPS={s['fps']:.2f})",
+        "===================================================\n",
+    ]
+    for ln in lines:
+        log_fn(ln)
 
 
 # ---------------------------
@@ -597,6 +641,12 @@ def parse_args() -> argparse.Namespace:
         help="CLIP model name used to encode text labels (e.g., ViT-B/32, RN50x16, RN101, ViT-B/16, ViT-L/14)",
     )
     p.add_argument(
+        "--clip_device",
+        choices=["cuda", "cpu"],
+        default="cuda",
+        help="Device to load CLIP text encoder (use cpu on memory-constrained Jetson)",
+    )
+    p.add_argument(
         "--prompt",
         choices=["plain", "a_photo_of_a"],
         default="plain",
@@ -606,12 +656,38 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_legend", action="store_true", help="Disable legend drawing")
     p.add_argument("--window", type=str, default="LSeg", help="OpenCV window title")
     p.add_argument("--no_display", action="store_true", help="Run without cv2.imshow (benchmark only)")
+    p.add_argument(
+        "--show_mask",
+        dest="show_mask",
+        action="store_true",
+        default=True,
+        help="Show mask-only window in addition to overlay (default: on)",
+    )
+    p.add_argument(
+        "--no_show_mask",
+        dest="show_mask",
+        action="store_false",
+        help="Disable mask-only window",
+    )
+    p.add_argument("--log_file", type=str, default=None, help="Append logs and benchmark to this file")
+    p.add_argument("--report_every", type=int, default=50, help="Report rolling stats every N measured frames (0=disable)")
+    p.add_argument("--infer_every", type=int, default=1, help="Run encoder every N frames (reuse last mask otherwise)")
+    p.add_argument("--fps_cap", type=float, default=0.0, help="Cap display loop to N FPS (0=uncapped)")
+    p.add_argument("--coverage_top", type=int, default=3, help="Show top-K label coverage percentages on overlay")
+    p.add_argument("--low_mem_mask", action="store_true", help="Reduce GPU memory: do argmax at feature res and resize mask on CPU (slightly blockier edges)")
+    p.add_argument("--mask_device", choices=["cuda", "cpu"], default="cuda", help="Device for mask similarity; cpu reduces GPU memory at cost of speed")
 
     p.add_argument(
         "--backend",
         choices=["trt", "torch"],
         default="trt",
         help="Inference backend for image encoder",
+    )
+    p.add_argument(
+        "--encoder_device",
+        choices=["cuda", "cpu"],
+        default="cuda",
+        help="Device to place the image encoder (torch backend only). Use cpu on Jetson if GPU OOM.",
     )
 
     # Inputs for backend
@@ -634,14 +710,32 @@ def parse_args() -> argparse.Namespace:
 
     # Benchmark control
     p.add_argument("--warmup", type=int, default=30, help="Warmup frames")
-    p.add_argument("--frames", type=int, default=300, help="Number of measured frames (after warmup)")
-    p.add_argument("--max_frames", type=int, default=0, help="Hard stop after N frames (0=disabled). If set, overrides --warmup/--frames")
+    p.add_argument(
+        "--frames",
+        type=int,
+        default=0,
+        help="Number of measured frames after warmup (0=run until user quits)",
+    )
+    p.add_argument(
+        "--max_frames",
+        type=int,
+        default=0,
+        help="Hard stop after N total frames (0=disabled). If set, overrides --warmup/--frames)",
+    )
 
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    # Logging helper (stdout + optional file append)
+    log_fh = open(args.log_file, "a") if args.log_file else None
+    def log_fn(msg: str) -> None:
+        print(msg)
+        if log_fh:
+            log_fh.write(msg + "\n")
+            log_fh.flush()
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available inside this container. Check --gpus/--runtime settings.")
@@ -659,9 +753,16 @@ def main() -> None:
     if backbone == "auto":
         backbone = infer_backbone_from_path(args.weights)
 
+    # Devices
+    enc_device = torch.device("cuda" if args.backend == "trt" else args.encoder_device)
+    mask_device = torch.device(args.mask_device)
+    clip_device = torch.device(args.clip_device)
+
+    # propagate clip device to downstream modules that still call clip.load internally
+    os.environ["CLIP_DEVICE"] = args.clip_device
+
     # Load CLIP text features (once)
-    device = torch.device("cuda")
-    clip_model, _ = clip.load(args.clip_model, device=device, jit=False)
+    clip_model, _ = clip.load(args.clip_model, device=clip_device, jit=False)
     clip_model.eval()
     with torch.no_grad():
         clip_labels = labels
@@ -674,10 +775,18 @@ def main() -> None:
             for i, (raw, prm) in enumerate(zip(labels, clip_labels)):
                 print(f"  - {i:02d}: '{raw}' -> '{prm}'")
 
-        text_tokens = clip.tokenize(clip_labels).to(device)
+        text_tokens = clip.tokenize(clip_labels).to(clip_device)
         text_features = clip_model.encode_text(text_tokens)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         text_features = text_features.float()
+        # move to mask device if needed
+        if mask_device.type == "cuda":
+            text_features = text_features.to(mask_device)
+
+    # Free CLIP model memory if it was on CUDA (Jetson OOM prevention)
+    if clip_device.type == "cuda":
+        del clip_model
+        torch.cuda.empty_cache()
 
     # Backend init
     engine_path = None
@@ -707,7 +816,8 @@ def main() -> None:
         print(f"[TRT ] loaded engine: {engine_path}")
     else:
         torch_encoder = load_torch_encoder(args.weights, backbone)
-        print("[TORCH] loaded ckpt encoder")
+        torch_encoder = torch_encoder.to(enc_device)
+        print(f"[TORCH] loaded ckpt encoder on {enc_device}")
 
     # Camera
     cap = open_camera(args.device, args.cam_w, args.cam_h, args.cam_fps)
@@ -715,6 +825,9 @@ def main() -> None:
 
     # Benchmark containers
     stats = Stats(frames=int(args.frames), warmup=int(args.warmup), encoder_ms=[], total_ms=[])
+    if args.report_every > 0:
+        stats.enc_window = deque(maxlen=args.report_every)
+        stats.tot_window = deque(maxlen=args.report_every)
 
     # Timing helpers
     ev_start = torch.cuda.Event(enable_timing=True)
@@ -724,7 +837,7 @@ def main() -> None:
     frame_idx = 0
     measured = 0
     warmup_left = int(args.warmup)
-    max_measured = int(args.frames)
+    max_measured = int(args.frames) if int(args.frames) > 0 else math.inf
 
     if args.max_frames and int(args.max_frames) > 0:
         # Interpret as total frames including warmup.
@@ -733,11 +846,38 @@ def main() -> None:
 
     t_last = time.perf_counter()
     fps_smooth = 0.0
+    last_mask_cpu = None
+    last_enc_ms = None
+
+    # label coverage text cache to avoid repeated allocations
+    def draw_coverages(img_bgr: np.ndarray, mask_cpu: np.ndarray) -> None:
+        if mask_cpu is None:
+            return
+        counts = np.bincount(mask_cpu.reshape(-1), minlength=len(labels))
+        total = mask_cpu.size
+        top_ids = counts.argsort()[::-1][: max(1, args.coverage_top)]
+        y0 = 30
+        for idx, lid in enumerate(top_ids):
+            if counts[lid] == 0:
+                continue
+            pct = counts[lid] * 100.0 / total
+            text = f"{labels[lid]}: {pct:.1f}%"
+            color = palette[lid]
+            cv2.putText(
+                img_bgr,
+                text,
+                (10, y0 + idx * 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (int(color[2]), int(color[1]), int(color[0])),
+                2,
+                cv2.LINE_AA,
+            )
 
     while True:
         ok, frame_bgr = cap.read()
         if not ok:
-            print("[WARN] camera read failed, exiting")
+            log_fn("[WARN] camera read failed, exiting")
             break
         if frame_bgr.ndim == 3 and frame_bgr.shape[2] == 4:
             frame_bgr = frame_bgr[:, :, :3]
@@ -746,37 +886,63 @@ def main() -> None:
 
         # Preprocess (CPU)
         x_cpu = preprocess_frame_to_tensor(frame_bgr, input_hw)
-        x = x_cpu.to(device, non_blocking=False)
+        x = x_cpu.to(enc_device, non_blocking=False)
 
-        # Encoder inference (GPU)
-        ev_start.record()
-        if args.backend == "trt":
-            assert trt_encoder is not None
-            feat = trt_encoder(x)
+        # Encoder inference (GPU) - optional frame skipping
+        run_infer = (frame_idx % max(1, args.infer_every) == 0)
+        if run_infer:
+            ev_start.record()
+            if args.backend == "trt":
+                assert trt_encoder is not None
+                feat = trt_encoder(x)
+            else:
+                assert torch_encoder is not None
+                feat = torch_encoder(x)
+            ev_end.record()
         else:
-            assert torch_encoder is not None
-            feat = torch_encoder(x)
-        ev_end.record()
+            feat = None
 
-        # Postprocess: logits upsample -> argmax (GPU) -> mask (CPU)
-        # Only upsample to camera res when we actually display (keeps benchmark overhead lower).
-        out_hw = (args.cam_h, args.cam_w) if not args.no_display else None
-        mask = compute_mask_from_features(feat, text_features, out_hw=out_hw)
-        mask_cpu = mask.to("cpu", non_blocking=False).numpy().astype(np.uint8)
+        # Postprocess: logits -> argmax
+        # If low_mem_mask: argmax at feature resolution, then CPU resize later (saves big GPU memory)
+        out_hw = None if args.low_mem_mask else ((args.cam_h, args.cam_w) if not args.no_display else None)
+        if run_infer:
+            mask = compute_mask_from_features(feat, text_features, out_hw=out_hw, mask_device=args.mask_device)
+            mask_cpu = mask.to("cpu", non_blocking=False).numpy().astype(np.uint8)
+            last_mask_cpu = mask_cpu
+        else:
+            mask_cpu = last_mask_cpu
 
         # GPU time
-        torch.cuda.synchronize()
-        enc_ms = float(ev_start.elapsed_time(ev_end))
+        if run_infer:
+            torch.cuda.synchronize()
+            enc_ms = float(ev_start.elapsed_time(ev_end))
+            last_enc_ms = enc_ms
+        else:
+            enc_ms = last_enc_ms if last_enc_ms is not None else 0.0
 
         # Visualization (CPU)
         if not args.no_display:
             # mask_cpu is already camera resolution because we upsampled logits before argmax.
-            color_mask = palette[mask_cpu]  # (H,W,3) BGR
-            blended = cv2.addWeighted(frame_bgr, 1.0 - args.alpha, color_mask, args.alpha, 0)
+            if mask_cpu is not None:
+                # optional CPU resize if low_mem_mask was used
+                if args.low_mem_mask and mask_cpu.shape[:2] != (args.cam_h, args.cam_w):
+                    mask_cpu = cv2.resize(
+                        mask_cpu,
+                        (args.cam_w, args.cam_h),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                color_mask = palette[mask_cpu]  # (H,W,3) BGR
+                blended = cv2.addWeighted(frame_bgr, 1.0 - args.alpha, color_mask, args.alpha, 0)
+                if args.show_mask:
+                    cv2.imshow(f"{args.window}-mask", color_mask)
+            else:
+                blended = frame_bgr
 
-            # Legend
+            # Legend + coverage text
             if not args.no_legend:
                 draw_legend(blended, labels, palette)
+            if mask_cpu is not None:
+                draw_coverages(blended, mask_cpu)
 
             # FPS (smoothed)
             now = time.perf_counter()
@@ -824,8 +990,25 @@ def main() -> None:
         stats.add(enc_ms, total_ms)
         measured += 1
 
+        # mid-run rolling report
+        if args.report_every > 0 and measured % args.report_every == 0:
+            ws = stats.window_summary()
+            log_fn(
+                f"[ROLLING] last {ws['frames']} frames: enc={ws['enc_avg_ms']:.2f}±{ws['enc_std_ms']:.2f} ms | "
+                f"total={ws['tot_avg_ms']:.2f}±{ws['tot_std_ms']:.2f} ms | fps={ws['fps']:.2f}"
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         if measured >= max_measured:
             break
+
+        # Optional FPS cap for the whole loop (display + processing)
+        if args.fps_cap and args.fps_cap > 0:
+            elapsed = time.perf_counter() - t0
+            sleep_for = max(0.0, (1.0 / args.fps_cap) - elapsed)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
     cap.release()
     if not args.no_display:
@@ -839,7 +1022,11 @@ def main() -> None:
         cam_hw=(args.cam_h, args.cam_w),
         labels=labels,
         stats=stats,
+        log_fn=log_fn,
     )
+
+    if log_fh:
+        log_fh.close()
 
 
 if __name__ == "__main__":
