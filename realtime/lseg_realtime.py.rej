@@ -1,0 +1,198 @@
+--- realtime/lseg_realtime.py
++++ realtime/lseg_realtime.py
+@@ -34,6 +34,27 @@
+ # 3rd-party
+ import clip
+ import tensorrt as trt
++# TensorRT <-> torch dtype helpers (for correct I/O buffer types)
++_TRt_TO_TORCH = {
++    trt.DataType.FLOAT: torch.float32,
++    trt.DataType.HALF: torch.float16,
++    trt.DataType.INT8: torch.int8,
++    trt.DataType.INT32: torch.int32,
++    trt.DataType.BOOL: torch.bool,
++}
++
++
++def _trt_dtype_to_torch(dtype: trt.DataType) -> torch.dtype:
++    if dtype not in _TRt_TO_TORCH:
++        raise ValueError(f"Unsupported TensorRT dtype: {dtype}")
++    return _TRt_TO_TORCH[dtype]
++
++
++def _pick_single(names: List[str], what: str) -> str:
++    if len(names) != 1:
++        raise RuntimeError(f"Expected exactly 1 {what} tensor, got: {names}")
++    return names[0]
++
+ 
+ # Repo modules (PyTorch checkpoints)
+ from modules.lseg_module import LSegModule
+@@ -280,7 +301,14 @@
+ 
+ 
+ class TRTEncoder:
+-    """TensorRT engine runner that binds torch CUDA tensors directly (no DtoH copy)."""
++    """TensorRT engine runner that binds torch CUDA tensors directly (no DtoH copy).
++
++    Why this exists:
++      * Engines can be built as FP16 → I/O tensors may be FP16.
++      * If you bind a torch.float32 buffer to an FP16 tensor address (or vice versa),
++        you will get corrupted outputs (segmentation looks random or collapses).
++      * Therefore, we query TensorRT I/O dtypes and allocate matching torch buffers.
++    """
+ 
+     def __init__(self, engine_path: str, input_shape: Tuple[int, int, int, int]):
+         self.engine_path = engine_path
+@@ -293,31 +321,52 @@
+         if engine is None:
+             raise RuntimeError(f"Failed to load TRT engine: {engine_path}")
+         self.engine = engine
++
+         self.context = engine.create_execution_context()
+         if self.context is None:
+             raise RuntimeError("Failed to create TRT execution context")
+ 
+-        self.in_name = engine.get_tensor_name(0)
+-        self.out_name = engine.get_tensor_name(1)
++        # Robust I/O discovery (do NOT assume index 0=input, 1=output).
++        io_names = [engine.get_tensor_name(i) for i in range(engine.num_io_tensors)]
++        in_names = [n for n in io_names if engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT]
++        out_names = [n for n in io_names if engine.get_tensor_mode(n) == trt.TensorIOMode.OUTPUT]
++        self.in_name = _pick_single(in_names, "input")
++        self.out_name = _pick_single(out_names, "output")
++
++        # DTypes
++        self.in_dtype_trt = engine.get_tensor_dtype(self.in_name)
++        self.out_dtype_trt = engine.get_tensor_dtype(self.out_name)
++        self.in_dtype_torch = _trt_dtype_to_torch(self.in_dtype_trt)
++        self.out_dtype_torch = _trt_dtype_to_torch(self.out_dtype_trt)
+ 
+-        # Set shape once (fixed in this project).
++        # Set shape once (fixed in this project), engine may still have dynamic profiles.
+         self.context.set_input_shape(self.in_name, self.input_shape)
+         self.out_shape = tuple(self.context.get_tensor_shape(self.out_name))
+ 
+         # Output buffer (torch CUDA tensor). Reallocated if shape changes.
+-        self._out = torch.empty(self.out_shape, device="cuda", dtype=torch.float32)
++        self._out = torch.empty(self.out_shape, device="cuda", dtype=self.out_dtype_torch)
++
++        print(
++            f"[TRT ] I/O: input={self.in_name} {self.in_dtype_trt} {self.input_shape}  | "
++            f"output={self.out_name} {self.out_dtype_trt} {self.out_shape}"
++        )
+ 
+     def __call__(self, x_cuda: torch.Tensor) -> torch.Tensor:
+         if not x_cuda.is_cuda:
+             raise ValueError("TRTEncoder expects a CUDA tensor")
++
++        # Match engine input dtype (common: FP32 or FP16)
++        if x_cuda.dtype != self.in_dtype_torch:
++            x_cuda = x_cuda.to(dtype=self.in_dtype_torch)
++
++        # Support dynamic shapes if engine profile allows.
+         if tuple(x_cuda.shape) != self.input_shape:
+-            # Support dynamic shapes if engine profile allows.
+             self.context.set_input_shape(self.in_name, tuple(x_cuda.shape))
+             self.input_shape = tuple(x_cuda.shape)
+             new_out_shape = tuple(self.context.get_tensor_shape(self.out_name))
+             if new_out_shape != self.out_shape:
+                 self.out_shape = new_out_shape
+-                self._out = torch.empty(self.out_shape, device="cuda", dtype=torch.float32)
++                self._out = torch.empty(self.out_shape, device="cuda", dtype=self.out_dtype_torch)
+ 
+         if not x_cuda.is_contiguous():
+             x_cuda = x_cuda.contiguous()
+@@ -331,7 +380,6 @@
+             raise RuntimeError("TensorRT execute_async_v3 returned False")
+         return self._out
+ 
+-
+ def load_torch_encoder(weights: str, backbone: str) -> torch.nn.Module:
+     """Load LSeg image-encoder from ckpt (PyTorch)."""
+     weights = str(weights)
+@@ -401,23 +449,33 @@
+ def compute_mask_from_features(
+     image_features: torch.Tensor,  # (1,C,Hf,Wf)
+     text_features: torch.Tensor,  # (N,C)
++    *,
++    eps: float = 1e-6,
+ ) -> torch.Tensor:
+-    """Return argmax mask on GPU with shape (Hf, Wf)."""
+-    # Ensure float32 for stable matmul
++    """Return argmax mask on GPU with shape (Hf, Wf).
++
++    Notes:
++      * LSeg-style inference uses cosine similarity between per-pixel embeddings and text embeddings.
++      * Some exported / TensorRT engines may output FP16 tensors; we upcast + re-normalize for stability.
++    """
+     if image_features.dtype != torch.float32:
+         image_features = image_features.float()
+     if text_features.dtype != torch.float32:
+         text_features = text_features.float()
+ 
+-    b, c, hf, wf = image_features.shape
+-    assert b == 1, "This script assumes batch=1"
+-    img_flat = image_features.view(c, -1)  # (C, Hf*Wf)
+-    sim = torch.matmul(text_features, img_flat)  # (N, Hf*Wf)
+-    sim = sim.view(text_features.shape[0], hf, wf)
+-    mask = torch.argmax(sim, dim=0)  # (Hf, Wf)
++    # Ensure contiguous for einsum/matmul
++    if not image_features.is_contiguous():
++        image_features = image_features.contiguous()
++
++    # (Safety) Normalize again. (Some checkpoints already normalize inside the network.)
++    image_features = image_features / (image_features.norm(dim=1, keepdim=True) + eps)
++    text_features = text_features / (text_features.norm(dim=-1, keepdim=True) + eps)
++
++    # similarity: (B=1, N, Hf, Wf)
++    sim = torch.einsum("nc,bchw->bnhw", text_features, image_features)
++    mask = torch.argmax(sim, dim=1)[0]  # (Hf, Wf)
+     return mask
+ 
+-
+ def infer_backbone_from_path(weights: str) -> str:
+     p = weights.lower()
+     if "resnet" in p or "rn101" in p or "/resnet" in p:
+@@ -510,6 +568,18 @@
+         default="person, chair, desk, monitor, keyboard, background",
+         help="Comma separated label list",
+     )
++    p.add_argument(
++        "--clip_model",
++        type=str,
++        default="ViT-B/32",
++        help="CLIP model name used to encode text labels (e.g., ViT-B/32, RN50x16, RN101, ViT-B/16, ViT-L/14)",
++    )
++    p.add_argument(
++        "--prompt",
++        choices=["plain", "a_photo_of_a"],
++        default="plain",
++        help="Prompt template for CLIP text embeddings",
++    )
+     p.add_argument("--alpha", type=float, default=0.45, help="Alpha blending ratio for mask overlay")
+     p.add_argument("--no_legend", action="store_true", help="Disable legend drawing")
+     p.add_argument("--window", type=str, default="LSeg", help="OpenCV window title")
+@@ -569,10 +639,20 @@
+ 
+     # Load CLIP text features (once)
+     device = torch.device("cuda")
+-    clip_model, _ = clip.load("ViT-B/32", device=device, jit=False)
++    clip_model, _ = clip.load(args.clip_model, device=device, jit=False)
+     clip_model.eval()
+     with torch.no_grad():
+-        text_tokens = clip.tokenize(labels).to(device)
++        clip_labels = labels
++        if args.prompt == "a_photo_of_a":
++            clip_labels = [f"a photo of a {l}" for l in labels]
++
++        # Print prompts once (helps debug "segmentation looks wrong")
++        print(f"[CLIP] model={args.clip_model}  prompt={args.prompt}")
++        if len(clip_labels) <= 30:
++            for i, (raw, prm) in enumerate(zip(labels, clip_labels)):
++                print(f"  - {i:02d}: '{raw}' -> '{prm}'")
++
++        text_tokens = clip.tokenize(clip_labels).to(device)
+         text_features = clip_model.encode_text(text_tokens)
+         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+         text_features = text_features.float()

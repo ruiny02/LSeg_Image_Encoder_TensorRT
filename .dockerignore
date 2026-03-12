@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# generated / caches
+models/onnx_engines/
+models/trt_engines/
+**/*.onnx
+**/*.engine
+**/*.plan
+**/*.trt
+**/*.cache
+
+# large weights/assets (host mount로 처리)
+models/weights/
+**/*.ckpt
+**/*.pth
+**/*.pt
+assets/

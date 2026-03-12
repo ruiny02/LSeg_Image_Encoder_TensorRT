@@ -95,6 +95,9 @@ def main():
                         default=[256,320,384,480,640,768,1024])
     parser.add_argument('--iterations', type=int, default=1000)
     parser.add_argument('--resize', type=int, default=None)
+    parser.add_argument('--input_hw', nargs=2, type=int, default=None,
+                        metavar=('H', 'W'),
+                        help='Override input height/width (e.g., 288 512). When set, img_sizes/resize only affect naming for logs.')
     parser.add_argument('--trt_workspace', type=int, default=1<<30,
                         help='Workspace in bytes (1<<30=1GiB)')
     # TRT flags
@@ -109,6 +112,12 @@ def main():
     parser.add_argument('--no-trt_cublas', dest='trt_cublas', action='store_false')
     parser.add_argument('--trt_cudnn', action='store_true', default=True)
     parser.add_argument('--no-trt_cudnn', dest='trt_cudnn', action='store_false')
+    parser.add_argument('--skip_build', action='store_true',
+                        help='Do not build ONNX/TRT; fail if engine missing.')
+    parser.add_argument('--skip_pytorch', action='store_true',
+                        help='Skip PyTorch timing; run only TRT benchmarks.')
+    parser.add_argument('--skip_cpp', action='store_true',
+                        help='Skip C++ TRT timing.')
     args = parser.parse_args()
 
     records = []
@@ -116,7 +125,18 @@ def main():
 
 
     # 1) 각 백본별 ckpt 개수 * size 개수로 전체 작업 수 계산
-    total_sizes = len(args.img_sizes)
+    # Resolve per-size H/W list
+    per_sizes = []
+    if args.input_hw:
+        # Single explicit shape
+        h, w = map(int, args.input_hw)
+        per_sizes.append((f"{h}x{w}", h, w))
+    else:
+        for size in args.img_sizes:
+            hw = args.resize if args.resize else size
+            per_sizes.append((size, hw, hw))
+
+    total_sizes = len(per_sizes)
     tasks_per_backbone = []
     for backbone in backbone_list:
         ckpt_dir = os.path.join(args.weights_dir, backbone)
@@ -132,8 +152,6 @@ def main():
         total_ckpts = len(ckpt_list)
 
         for c_idx, ckpt in enumerate(ckpt_list, start=1):
-            total_sizes = len(args.img_sizes)
-
             tag = os.path.splitext(os.path.basename(ckpt))[0]
 
             # ViT은 vit, Resnet-ZS는 rn101 키를 써야 onnx/model_to_onnx_zs.py 에서 저장한 이름과 일치합니다
@@ -149,25 +167,54 @@ def main():
                 run_subprocess(['python3', onnx_script, '--weights', ckpt])
             # TRT build
             trt_dir = os.path.join('models','trt_engines'); os.makedirs(trt_dir, exist_ok=True)
+            # NOTE: conversion/onnx_to_trt.py now supports explicit (min/opt/max) profiles and
+            # includes them in the engine filename.
+            # Profile H/W (supports non-square via --input_hw)
+            if args.input_hw:
+                sizes_for_profile = [tuple(args.input_hw)]
+            elif args.resize:
+                sizes_for_profile = [(args.resize, args.resize)]
+            else:
+                sizes_for_profile = [(s, s) for s in args.img_sizes]
+
+            min_h = min(h for h, _ in sizes_for_profile)
+            min_w = min(w for _, w in sizes_for_profile)
+            max_h = max(h for h, _ in sizes_for_profile)
+            max_w = max(w for _, w in sizes_for_profile)
+            opt_h, opt_w = sizes_for_profile[len(sizes_for_profile)//2]
+
+            prec_tag = 'fp16' if args.trt_fp16 else 'fp32'
             flags = [
-                'fp16' if args.trt_fp16 else 'fp32',
-                'sparse' if args.trt_sparse else 'nosparse',
-                'noTC' if args.trt_no_tc else 'tc',
-                'gpuFB' if args.trt_gpu_fb else 'nogpuFB',
-                'dbg' if args.trt_debug else 'nodebug',
-                'cublas' if args.trt_cublas else 'nocublas',
-                'cudnn' if args.trt_cudnn else 'nocudnn',
-                f"ws{args.trt_workspace>>20}MiB"
+                prec_tag,
+                'sparse' if args.trt_sparse else None,
+                'noTC' if args.trt_no_tc else None,
+                'gpuFB' if args.trt_gpu_fb else None,
+                'dbg' if args.trt_debug else None,
+                'cublas' if args.trt_cublas else None,
+                'cudnn' if args.trt_cudnn else None,
+                f"min{min_h}x{min_w}",
+                f"opt{opt_h}x{opt_w}",
+                f"max{max_h}x{max_w}",
+                f"ws{args.trt_workspace>>20}MiB",
             ]
-            suffix = '_'.join(flags)
+            suffix = '_'.join([f for f in flags if f])
             engine_file = find_engine_file(trt_dir, base, suffix)
             if engine_file:
                 print(f"✅ TRT engine exists, skip: {engine_file}")
             else:
+                if args.skip_build:
+                    raise FileNotFoundError(f"Missing engine {base}__{suffix}.trt and --skip_build was set.")
                 print(f"Building TRT engine: {base}__{suffix}.trt")
-                cmd = ['python3', 'conversion/onnx_to_trt.py', '--onnx', onnx_path, '--workspace', str(args.trt_workspace)]
-                cmd += ['--fp16'] if args.trt_fp16 else ['--no-trt_fp16']
-                cmd += ['--sparse'] if args.trt_sparse else ['--no-trt_sparse']
+                cmd = [
+                    'python3', 'conversion/onnx_to_trt.py',
+                    '--onnx', onnx_path,
+                    '--workspace', str(args.trt_workspace),
+                    '--min_hw', str(min_h), str(min_w),
+                    '--opt_hw', str(opt_h), str(opt_w),
+                    '--max_hw', str(max_h), str(max_w),
+                ]
+                cmd += ['--fp16'] if args.trt_fp16 else ['--no-fp16']
+                cmd += ['--sparse'] if args.trt_sparse else ['--no-sparse']
                 if args.trt_no_tc: cmd.append('--disable-timing-cache')
                 if args.trt_gpu_fb: cmd.append('--gpu-fallback')
                 if args.trt_debug: cmd.append('--debug')
@@ -177,7 +224,10 @@ def main():
                 engine_file = find_engine_file(trt_dir, base, suffix)
             print(f"Using TRT engine: {engine_file}")
             # Load model once
-            max_crop = max(args.img_sizes)
+            max_crop = max(
+                max(h for _, h, _ in per_sizes),
+                max(w for _, _, w in per_sizes),
+            )
             if backbone=='ViT':
                 module = LSegModule.load_from_checkpoint(
                     checkpoint_path=ckpt, map_location='cpu', backbone='clip_vitl16_384', aux=False,
@@ -200,7 +250,7 @@ def main():
                     nshot=1, finetune_mode=False, activation='lrelu'
                 ).net
             # Benchmark per size
-            for s_idx, size in enumerate(args.img_sizes, start=1):
+            for s_idx, (size_label, height, width) in enumerate(per_sizes, start=1):
                 # 2) 글로벌 스텝 +1, percent 계산
                 global_step += 1
                 percent = global_step / total_tasks * 100
@@ -213,20 +263,26 @@ def main():
                     f"({b_idx}/{len(backbone_list)}) | "
                     f"Checkpoint = {os.path.basename(ckpt)} "
                     f"({c_idx}/{len(ckpt_list)}) | "
-                    f"Size = {size} ×  {size} "
+                    f"Input = {height} × {width} "
                     f"({s_idx}/{total_sizes})"
                 )
 
-                height, width = (args.resize, args.resize) if args.resize else (size, size)
                 inp = torch.ones(1,3,height,width)
-                pt_avg, pt_std = measure_pytorch_inference_time(module, inp, args.iterations)
+                pt_avg = pt_std = float('nan')
+                if not args.skip_pytorch:
+                    pt_avg, pt_std = measure_pytorch_inference_time(module, inp, args.iterations)
+
                 trt_avg, trt_std = measure_tensorrt_inference_time(engine_file, inp, args.iterations, dynamic=True)
-                print("C++ Inference Benchmark is running...")
-                cpp_avg, cpp_std = run_cpp_benchmark(engine_file, args.iterations, height, width)
+
+                cpp_avg = cpp_std = float('nan')
+                if not args.skip_cpp:
+                    print("C++ Inference Benchmark is running...")
+                    cpp_avg, cpp_std = run_cpp_benchmark(engine_file, args.iterations, height, width)
+
                 record = {
                     'Backbone': backbone,
                     'Checkpoint': os.path.basename(ckpt),
-                    'Size': size,
+                    'Size': f"{height}x{width}",
                     'Crop Size': max_crop,
                     'PyTorch Avg(ms)': pt_avg, 'PyTorch Std(ms)': pt_std,
                     'TRT Python Avg(ms)': trt_avg, 'TRT Python Std(ms)': trt_std,

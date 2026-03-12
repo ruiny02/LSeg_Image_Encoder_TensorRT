@@ -32,8 +32,18 @@ outputs/
 *.ckpt
 *.onnx
 *.trt
+models/weights/
 
 # Dataset 관련
 fewshot_data/
 
 result.txt
+
+
+# skill 관련
+/docs
+
+
+
+# inferenceTimeTester 로그
+logs/

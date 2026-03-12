@@ -1,0 +1,158 @@
+# syntax=docker/dockerfile:1.6
+
+ARG BASE_IMAGE=nvcr.io/nvidia/l4t-jetpack:r36.4.0
+
+############################
+# build stage
+############################
+FROM ${BASE_IMAGE} AS build
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 필수 패키지: 빌드/런타임 공통 + OpenCV(GStreamer) + X11 + v4l2 + gstreamer
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-venv python3-dev python3-pip \
+    build-essential cmake git wget curl pkg-config \
+    zlib1g-dev libopenblas-dev \
+    libopencv-dev python3-opencv \
+    libgl1 libglib2.0-0 \
+    libxext6 libxrender1 libsm6 \
+    libgtk-3-0 libcanberra-gtk3-module \
+    v4l-utils \
+    gstreamer1.0-tools \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
+    gstreamer1.0-x \
+  && rm -rf /var/lib/apt/lists/*
+
+# venv (JetPack 기본 라이브러리(tensorrt 등) 접근을 위해 system-site-packages 사용)
+RUN python3 -m venv --system-site-packages /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+# --------------------------
+# cuSPARSELt (Jetson/tegra용 설치)
+# - install_cusparselt.sh는 CUDA 12.6에서 실패하는 케이스가 있어,
+#   tegra local repo deb로 설치
+# --------------------------
+RUN set -eux; \
+  if [ ! -f /usr/local/cuda/lib64/libcusparseLt.so ] && [ ! -f /usr/local/cuda/lib64/libcusparseLt.so.0 ]; then \
+    CUSP_VER=0.7.0; \
+    wget -q https://developer.download.nvidia.com/compute/cusparselt/${CUSP_VER}/local_installers/cusparselt-local-tegra-repo-ubuntu2204-${CUSP_VER}_1.0-1_arm64.deb \
+      -O /tmp/cusparselt.deb; \
+    dpkg -i /tmp/cusparselt.deb; \
+    cp /var/cusparselt-local-tegra-repo-ubuntu2204-${CUSP_VER}/cusparselt-*-keyring.gpg /usr/share/keyrings/; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends libcusparselt0 libcusparselt-dev; \
+    rm -f /tmp/cusparselt.deb; \
+    ldconfig; \
+  fi; \
+  ls -l /usr/local/cuda/lib64/libcusparseLt.so* || true; \
+  ldconfig -p | grep -i cusparseLt || true
+
+# JetPack 6.2용 torch/torchvision (JPL index)
+RUN python3 -m pip install --no-cache-dir \
+    torch==2.8.0 torchvision==0.23.0 \
+    --index-url=https://pypi.jetson-ai-lab.io/jp6/cu126
+
+# 파이썬 deps
+COPY requirements/requirements.jetson.txt /tmp/requirements.jetson.txt
+RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.jetson.txt
+
+# (중요) TensorRT include/lib 경로를 /usr/local/tensorrt 로 맞춤 (C++ 빌드/코드 경로 호환)
+RUN set -eux; \
+  mkdir -p /usr/local/tensorrt; \
+  if [ -d /usr/include/aarch64-linux-gnu ]; then \
+    ln -snf /usr/include/aarch64-linux-gnu /usr/local/tensorrt/include; \
+  elif [ -d /usr/include ]; then \
+    ln -snf /usr/include /usr/local/tensorrt/include; \
+  fi; \
+  if [ -d /usr/lib/aarch64-linux-gnu ]; then \
+    ln -snf /usr/lib/aarch64-linux-gnu /usr/local/tensorrt/lib; \
+  elif [ -d /usr/lib ]; then \
+    ln -snf /usr/lib /usr/local/tensorrt/lib; \
+  fi; \
+  ldconfig
+
+# (수정) libcudart 위치 탐색 시 /usr/local/cuda 심링크를 따라가도록 수정
+RUN set -eux; \
+  CUDA_ROOT="$(readlink -f /usr/local/cuda || echo /usr/local/cuda)"; \
+  echo "CUDA_ROOT=${CUDA_ROOT}"; \
+  REAL="$(find "${CUDA_ROOT}" -name 'libcudart.so*' -type f ! -path '*/stubs/*' | sort | tail -n1)"; \
+  echo "REAL_CUDART=${REAL}"; \
+  test -n "${REAL}"; \
+  LIB64="$(readlink -f /usr/local/cuda/lib64 2>/dev/null || true)"; \
+  if [ -z "${LIB64}" ]; then LIB64="${CUDA_ROOT}/lib64"; fi; \
+  mkdir -p "${LIB64}"; \
+  ln -sf "${REAL}" "${LIB64}/libcudart.so"; \
+  ldconfig
+  
+# --------------------------
+# C++ prebuild (Jetson 주의)
+# - Jetson은 docker build 단계에서 nvidia runtime 마운트가 없어
+#   libnvinfer.so가 의존하는 DLA/cuDLA 라이브러리(libnvdla_compiler.so, libnvcudla.so 등)가
+#   보이지 않아 링크가 깨질 수 있음.
+# - 기본(BUILD_CPP=0)은 스킵하고, 컨테이너 실행 후(runtime) 빌드를 권장.
+# - 정말 이미지 빌드 단계에서 하고 싶으면: docker build --build-arg BUILD_CPP=1 ...
+# --------------------------
+ARG BUILD_CPP=0
+
+# prebuilt 디렉토리는 항상 생성 (runtime stage COPY/사용 편의)
+RUN mkdir -p /opt/prebuilt/Inference_Time_Tester /opt/prebuilt/Feature_Extractor
+
+COPY CPP_Project /opt/src/CPP_Project
+WORKDIR /opt/src
+
+RUN set -eux; \
+  if [ "${BUILD_CPP}" = "1" ]; then \
+    echo "[CPP] Building C++ binaries in docker build stage (may fail on Jetson without runtime mounts)"; \
+    CUDA_STUB="/usr/local/cuda/lib64/stubs/libcuda.so"; \
+    cd CPP_Project/Inference_Time_Tester; \
+    cmake -B build -S . -DCUDA_DRIVER_LIBRARY="${CUDA_STUB}" || cmake -B build -S .; \
+    cmake --build build -j"$(nproc)"; \
+    cd ../Feature_Extractor; \
+    cmake -B build -S . -DCUDA_DRIVER_LIBRARY="${CUDA_STUB}" || cmake -B build -S .; \
+    cmake --build build -j"$(nproc)"; \
+    cp -f ../Inference_Time_Tester/build/trt_cpp_infer_time_tester /opt/prebuilt/Inference_Time_Tester/; \
+    cp -f build/trt_feature_extractor /opt/prebuilt/Feature_Extractor/; \
+  else \
+    echo "[CPP] Skipping C++ build at docker build time (recommended on Jetson). Build at runtime instead."; \
+  fi
+
+############################
+# runtime stage
+############################
+FROM ${BASE_IMAGE} AS runtime
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-venv python3-pip \
+    cmake build-essential pkg-config \
+    libopenblas-dev \
+    libopencv-dev python3-opencv \
+    libgl1 libglib2.0-0 \
+    libxext6 libxrender1 libsm6 \
+    libgtk-3-0 libcanberra-gtk3-module \
+    v4l-utils \
+    gstreamer1.0-tools \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
+    gstreamer1.0-x \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/venv /opt/venv
+COPY --from=build /opt/prebuilt /opt/prebuilt
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENV PATH=/opt/venv/bin:$PATH
+ENV PYTHONPATH=/workspace
+WORKDIR /workspace
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["bash"]
